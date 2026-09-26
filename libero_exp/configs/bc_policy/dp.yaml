@@ -10,6 +10,11 @@ defaults:
 
 experiment_dir: ???
 
+# H past/current observations condition H future actions. SequenceDataset
+# internally returns 2H-1 observations; the model explicitly masks the future.
+data:
+  frame_stack: 10
+
 hydra:
   run:
     dir: ./outputs/libero/${algo.algo_name}/dp/${data.env_name}/ratio${data.train_ratio}/${now:%m%d}_${now:%H%M}_seed${train.seed}
@@ -23,3 +28,26 @@ wandb:
   name: ${data.env_name}_${algo.algo_name}_dp_${now:%m%d}_${now:%H%M}_seed${train.seed}_ratio${data.train_ratio}_${hydra:job.num}
   group: ${data.env_name}_${algo.algo_name}_dp
   dir: ./wandb/${env.env_type}/${algo.algo_name}/dp/${data.env_name}/ratio${data.train_ratio}
+
+sampler:
+  enable: false
+  strategy: value_guided
+  critic_checkpoint_path: ???
+  state_dim: 9
+  action_dim: 7
+  action_horizon: 10
+  chunk_critic: true
+  num_samples: 8
+  execution_index: 0
+  q_value_threshold: 0.0
+  intervention_threshold: 0.1
+  acquisition:
+    mode: active
+    kappa: 1.0
+    uncertainty_weight: 0.5
+    coverage_weight: 0.5
+    min_safe_q: -1.0e9
+    trigger_q: -1.0e9
+    trigger_uncertainty: 0.25
+    trigger_coverage: 0.1
+    always_trigger: false

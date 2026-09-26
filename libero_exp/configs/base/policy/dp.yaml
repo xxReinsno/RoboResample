@@ -8,6 +8,7 @@ defaults:
     
 
 policy_type: BCDPPolicy 
+action_chunk_mode: future
 embed_size: 64
 
 extra_state_encoder:
@@ -22,5 +23,4 @@ temporal_transformer:
     transformer_mlp_hidden_size: 256
     transformer_dropout: 0.1
     transformer_max_seq_len: 10
-
 

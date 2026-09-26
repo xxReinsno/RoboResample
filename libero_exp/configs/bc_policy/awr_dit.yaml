@@ -1,0 +1,49 @@
+defaults:
+  - _self_
+  - ../base/data@data: default
+  - ../base/algo@algo: awr_policy
+  - ../base/policy@policy: dp
+  - ../base/train@train: default
+  - ../base/eval@eval: default
+  - ../base/env@env: default
+
+experiment_dir: ???
+
+data:
+  frame_stack: 10
+
+hydra:
+  run:
+    dir: ./outputs/libero/awr_dit/${data.env_name}/${now:%m%d}_${now:%H%M}_seed${train.seed}
+
+wandb:
+  use_wandb: true
+  project: resample-v2
+  name: ${data.env_name}_awr_dit_${now:%m%d}_${now:%H%M}_seed${train.seed}
+  group: ${data.env_name}_awr_dit
+  dir: ./wandb/${env.env_type}/awr_dit/${data.env_name}
+
+# Used by standalone inference/collection. Chunk-wise scoring is the default;
+# set chunk_critic=false and action_horizon=1 only for the single-step ablation.
+sampler:
+  enable: false
+  strategy: value_guided
+  critic_checkpoint_path: ${algo.awr.critic_checkpoint_path}
+  state_dim: ${algo.awr.state_dim}
+  action_dim: ${algo.awr.action_dim}
+  action_horizon: ${algo.awr.action_horizon}
+  chunk_critic: true
+  num_samples: 8
+  execution_index: 0
+  q_value_threshold: 0.0
+  intervention_threshold: 0.1
+  acquisition:
+    mode: active
+    kappa: 1.0
+    uncertainty_weight: 0.5
+    coverage_weight: 0.5
+    min_safe_q: -1.0e9
+    trigger_q: -1.0e9
+    trigger_uncertainty: 0.25
+    trigger_coverage: 0.1
+    always_trigger: false

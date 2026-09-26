@@ -127,7 +127,7 @@ class DPHead(nn.Module):
         return self.ddim_diffusion
 
 
-    
+
 
     def sample_loss(self, x_start, z, reduction='mean'):
         """
@@ -156,8 +156,8 @@ class DPHead(nn.Module):
         # Reshape and sum over features/time to get loss per sample
         loss = loss.mean(dim=list(range(1, loss.dim()))) # Shape: (N,)
 
+        loss = loss * self.loss_coef
         if reduction == 'mean':
             return loss.mean()
         elif reduction == 'none':
             return loss # <-- Return loss for each item in the batch
-    

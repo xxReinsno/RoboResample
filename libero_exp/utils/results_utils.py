@@ -75,7 +75,10 @@ def rollout(cfg,
             print(f"\nEnv: {env_idx}, Task_id: {task_idx}, Rollout: {num_env_rollout+1}/{num_env_rollouts} running...")
             env.reset()
             env.seed(cfg.train.seed)
-            policy.reset()
+            if adversarial_sampler is not None:
+                adversarial_sampler.reset()
+            else:
+                policy.reset()
             if video_writer != None:
                 video_writer.reset()
 
@@ -83,13 +86,15 @@ def rollout(cfg,
 
             # Initialize the data writer
             if data_writer or data_writer_succ:
+                active_writer = data_writer or data_writer_succ
                 episode_data_collectors = [{
-                    "obs": {key: [] for key in data_writer.obs_keys},
-                    "next_obs": {key: [] for key in data_writer.obs_keys},
+                    "obs": {key: [] for key in active_writer.obs_keys},
+                    "next_obs": {key: [] for key in active_writer.obs_keys},
                     "actions": [],
                     "rewards": [],
                     "dones": [],
                     "terminals": [],
+                    "acquisition": {},
                 } for _ in range(cfg.env.env_num)]
 
             if data_writer_succ:
@@ -124,14 +129,17 @@ def rollout(cfg,
                     elif isinstance(value, torch.Tensor):
                         data[key] = value.to(device)
 
-                if data_writer:
+                if data_writer or data_writer_succ:
                     # Make a deep copy of the observation dict to prevent modification by env.step
                     current_obs = {i: {k: v.copy() for k, v in obs[i].items()} for i in range(cfg.env.env_num)}
                 
                 # --- SELECT ACTION: ADVERSARIAL OR STANDARD ---
                 should_intervene = False
                 was_inserted_this_step = False
-                if adversarial_sampler is not None:
+                if adversarial_sampler is not None and hasattr(adversarial_sampler, "acquisition"):
+                    a, was_inserted_this_step = adversarial_sampler.select_action(data)
+                    inserted = inserted or was_inserted_this_step
+                elif adversarial_sampler is not None:
                     # TODO: Add Timestep policy
                     # Check the intervention condition (e.g., gripper width)
                     # We only need to check for the first env in the parallel batch
@@ -143,7 +151,9 @@ def rollout(cfg,
                         should_intervene = True
                         # logging.info(f"Intervening: {gripper_qpos_abs} < {adversarial_sampler.intervention_threshold} at timestep {step_i}")
 
-                if should_intervene and not inserted:
+                if adversarial_sampler is not None and hasattr(adversarial_sampler, "acquisition"):
+                    pass
+                elif should_intervene and not inserted:
                     a, was_inserted_this_step = adversarial_sampler.select_action(data)
                     if was_inserted_this_step:
                         inserted = True # Mark that an insertion happened in this episode
@@ -151,8 +161,11 @@ def rollout(cfg,
                     a = policy.get_action(cfg, data)
 
                 # copy the step data before env.step()
-                if data_writer:
+                if data_writer or data_writer_succ:
                     current_actions = a.copy() # Make a copy of the action
+                    selection_metadata = getattr(
+                        adversarial_sampler, "last_selection_metadata", None
+                    )
 
                 obs, r, done, info = env.step(a)
 
@@ -164,17 +177,26 @@ def rollout(cfg,
                     # Loop through each parallel environment
                     for i in range(cfg.env.env_num):
                         # --- Append observations for the i-th environment ---
-                        for key in data_writer.obs_keys:
+                        for key in active_writer.obs_keys:
                             # Append the state before the action was taken
                             episode_data_collectors[i]["obs"][key].append(current_obs[i][key])
                             # Append the state after the action was taken
                             episode_data_collectors[i]["next_obs"][key].append(next_obs[i][key])
                             
                         # --- Append other data for the i-th environment ---
-                        episode_data_collectors[i]["actions"].append(current_actions)
-                        episode_data_collectors[i]["rewards"].append(r)
-                        episode_data_collectors[i]["dones"].append(done)
-                        episode_data_collectors[i]["terminals"].append(done)
+                        action_i = current_actions[i] if (
+                            np.ndim(current_actions) > 1
+                            and len(current_actions) == cfg.env.env_num
+                        ) else current_actions
+                        reward_i = r[i] if np.ndim(r) > 0 else r
+                        done_i = done[i] if np.ndim(done) > 0 else done
+                        episode_data_collectors[i]["actions"].append(action_i)
+                        episode_data_collectors[i]["rewards"].append(reward_i)
+                        episode_data_collectors[i]["dones"].append(done_i)
+                        episode_data_collectors[i]["terminals"].append(done_i)
+                        if selection_metadata is not None:
+                            for key, value in selection_metadata.items():
+                                episode_data_collectors[i]["acquisition"].setdefault(key, []).append(value)
 
                 video_img = []
                 for k in range(cfg.env.env_num):
@@ -223,6 +245,7 @@ def rollout(cfg,
                         "actions": np.array(episode_data_collectors[i]["actions"]),
                         "rewards": np.array(episode_data_collectors[i]["rewards"]),
                         "dones": np.array(episode_data_collectors[i]["dones"]),
+                        "acquisition": episode_data_collectors[i]["acquisition"],
                     }
                     data_writer.write_episode(episode_to_write, task_description=env_description)
 
@@ -231,11 +254,12 @@ def rollout(cfg,
                     # For each parallel env, write its collected trajectory as a demo
                     # Convert lists of dicts/arrays into dicts of lists of arrays first
                     episode_to_write = {
-                        "obs": {key: np.array(episode_data_collectors[i]["obs"][key]) for key in data_writer.obs_keys},
-                        "next_obs": {key: np.array(episode_data_collectors[i]["next_obs"][key]) for key in data_writer.obs_keys},
+                        "obs": {key: np.array(episode_data_collectors[i]["obs"][key]) for key in data_writer_succ.obs_keys},
+                        "next_obs": {key: np.array(episode_data_collectors[i]["next_obs"][key]) for key in data_writer_succ.obs_keys},
                         "actions": np.array(episode_data_collectors[i]["actions"]),
                         "rewards": np.array(episode_data_collectors[i]["rewards"]),
                         "dones": np.array(episode_data_collectors[i]["dones"]),
+                        "acquisition": episode_data_collectors[i]["acquisition"],
                     }
                     data_writer_succ.write_episode(episode_to_write, task_description=env_description)
 

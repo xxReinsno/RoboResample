@@ -4,11 +4,11 @@ import glob
 import math
 import time
 import datetime
+import difflib
 import wandb
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data import ConcatDataset, DataLoader, RandomSampler
 import logging
 from tqdm import tqdm
@@ -29,6 +29,8 @@ from ..utils.record_utils import init_wandb, MetricLogger, BestAvgLoss, AverageM
 from ..data.data_writer import HDF5Writer, HDF5WriterSucc
 from calql.model import Critic
 from ..models.adversarial_sampler import AdversarialActionSampler
+from ..models.resample_v2 import ActiveValueAcquisition
+from ..models.value_guided_sampler import ValueGuidedActionSampler
 
 REGISTERED_ALGOS = {}
 
@@ -124,6 +126,7 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
         benchmark = get_benchmark(cfg.data.env_name)(cfg.data.task_order_index)
         n_tasks = benchmark.n_tasks
         train_manip_datasets, val_manip_datasets = [], []
+        train_is_rollout, train_task_ids = [], []
         descriptions = []
 
         shape_meta = None
@@ -134,6 +137,7 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                     obs_modality=cfg.data.obs.modality,
                     initialize_obs_utils=(i == 0),
                     seq_len=cfg.data.seq_len,
+                    frame_stack=cfg.data.frame_stack,
                     train_ratio=cfg.data.train_ratio,
                     train=True,
                     val_demo_num=cfg.data.val_demo_num,
@@ -143,6 +147,7 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                     obs_modality=cfg.data.obs.modality,
                     initialize_obs_utils=False,
                     seq_len=cfg.data.seq_len,
+                    frame_stack=cfg.data.frame_stack,
                     train_ratio=cfg.data.train_ratio,
                     train=False,
                     val_demo_num=cfg.data.val_demo_num,
@@ -153,6 +158,8 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                 raise
             
             train_manip_datasets.append(task_i_train_dataset)
+            train_is_rollout.append(False)
+            train_task_ids.append(i)
             val_manip_datasets.append(task_i_val_dataset)
             task_description = benchmark.get_task(i).language
             descriptions.append(task_description)
@@ -176,7 +183,9 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                         all_rollout_files.extend(hdf5_files_in_dir)
                         print(f"  - Found {len(hdf5_files_in_dir)} HDF5 files in directory: {path}")
                     elif path.endswith('.hdf5'):
-                        all_rollout_files.extend(glob.glob(path_pattern))
+                        all_rollout_files.append(path)
+
+            all_rollout_files = sorted(set(all_rollout_files))
             
             for rollout_path in all_rollout_files:
                 try:
@@ -190,9 +199,20 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
 
                     # append the data into training dataset
                     train_manip_datasets.append(rollout_dataset)
+                    train_is_rollout.append(True)
                     # remove env_name at the prefix and postfix
                     rollout_task_name = os.path.basename(rollout_path).replace("_demo.hdf5", "")
                     rollout_task_name = rollout_task_name.replace(f'{cfg.data.env_name}_','')
+                    normalized_name = rollout_task_name.replace("_", " ").lower()
+                    matching_task = max(
+                        range(n_tasks),
+                        key=lambda task_id: difflib.SequenceMatcher(
+                            None,
+                            normalized_name,
+                            descriptions[task_id].replace("_", " ").lower(),
+                        ).ratio(),
+                    )
+                    train_task_ids.append(matching_task)
                     descriptions.append(rollout_task_name)
                     
                     print(f"  - Successfully loaded and appended: {os.path.basename(rollout_path)}")
@@ -207,11 +227,17 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
         if os.path.exists(file_path):
             task_embs = torch.load(file_path)
         else:
-            task_embs = get_task_embs(cfg, descriptions, embedding_model_path)
+            task_embs = get_task_embs(cfg, descriptions[:n_tasks], embedding_model_path)
             torch.save(task_embs, file_path)
-        benchmark.set_task_embs(task_embs)
+        benchmark.set_task_embs(task_embs[:n_tasks])
 
-        train_datasets = [SequenceVLDataset(ds, emb) for (ds, emb) in zip(train_manip_datasets, task_embs)]
+        train_task_embs = [task_embs[task_id] for task_id in train_task_ids]
+        train_datasets = [
+            SequenceVLDataset(ds, emb, is_rollout=is_rollout, task_id=task_id)
+            for ds, emb, is_rollout, task_id in zip(
+                train_manip_datasets, train_task_embs, train_is_rollout, train_task_ids
+            )
+        ]
         train_concat_dataset = ConcatDataset(train_datasets)
         self.train_loader = DataLoader(
             train_concat_dataset,
@@ -505,7 +531,9 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
             
             # Use dimensions from the config file
             state_dim = cfg.sampler.state_dim
-            action_dim = 7
+            action_dim = cfg.sampler.get("action_dim", 7)
+            if cfg.sampler.get("chunk_critic", False):
+                action_dim *= cfg.sampler.action_horizon
 
             calql_critic = Critic(state_dim, action_dim).to(self.device)
             try:
@@ -516,16 +544,34 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                 # We should not proceed without the critic if sampling is enabled.
                 raise e
             
-            # --- 2.2 Instantiate the AdversarialActionSampler ---
-            adversarial_sampler = AdversarialActionSampler(
-                diffusion_policy=model,
-                calql_critic=calql_critic,
-                device=self.device,
-                num_samples=cfg.sampler.num_samples,
-                q_value_threshold=cfg.sampler.q_value_threshold
-            )
-            # Attach the intervention condition to the sampler object for clean passing
-            adversarial_sampler.intervention_threshold = cfg.sampler.intervention_threshold
+            if cfg.sampler.get("strategy", "legacy_adversarial") == "value_guided":
+                acquisition = ActiveValueAcquisition(
+                    mode=cfg.sampler.acquisition.mode,
+                    kappa=cfg.sampler.acquisition.kappa,
+                    uncertainty_weight=cfg.sampler.acquisition.uncertainty_weight,
+                    coverage_weight=cfg.sampler.acquisition.coverage_weight,
+                    min_safe_q=cfg.sampler.acquisition.min_safe_q,
+                    trigger_q=cfg.sampler.acquisition.trigger_q,
+                    trigger_uncertainty=cfg.sampler.acquisition.trigger_uncertainty,
+                    trigger_coverage=cfg.sampler.acquisition.trigger_coverage,
+                    always_trigger=cfg.sampler.acquisition.always_trigger,
+                )
+                adversarial_sampler = ValueGuidedActionSampler(
+                    policy=model,
+                    critics=calql_critic,
+                    acquisition=acquisition,
+                    num_candidates=cfg.sampler.num_samples,
+                    execution_index=cfg.sampler.execution_index,
+                )
+            else:
+                adversarial_sampler = AdversarialActionSampler(
+                    diffusion_policy=model,
+                    calql_critic=calql_critic,
+                    device=self.device,
+                    num_samples=cfg.sampler.num_samples,
+                    q_value_threshold=cfg.sampler.q_value_threshold
+                )
+                adversarial_sampler.intervention_threshold = cfg.sampler.intervention_threshold
         else:
             logging.info("Adversarial sampling is DISABLED. Running standard rollout.")
 
@@ -534,6 +580,7 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
 
         # --- 3. Initialize Data Writer (if enabled) ---
         data_writer = {}
+        data_writers = {}
         if cfg.eval.save_rollouts:
             
             logging.info(f"Rollout data saving is ENABLED.")
@@ -617,4 +664,3 @@ class BaseAlgo(nn.Module, metaclass=AlgoMeta):
                         print(f"Writer Closed: {writer}")
 
         return all_results
-

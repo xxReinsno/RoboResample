@@ -17,10 +17,19 @@ class HDF5CalQLDataset(Dataset):
     groups, with each group representing a single episode and containing its own
     'actions', 'dones', 'terminals', etc. datasets.
     """
-    def __init__(self, dataset_path: str, obs_keys: List[str], gamma: float):
+    def __init__(
+        self,
+        dataset_path: str,
+        obs_keys: List[str],
+        gamma: float,
+        action_horizon: int = 1,
+    ):
         self.dataset_path = dataset_path
         self.obs_keys = obs_keys
         self.gamma = gamma
+        if action_horizon < 1:
+            raise ValueError("action_horizon must be at least one")
+        self.action_horizon = action_horizon
         self.transitions = []
         self._load_and_process_data()
 
@@ -69,6 +78,15 @@ class HDF5CalQLDataset(Dataset):
                         # Correctly access datasets within the ep_data group
                         actions = ep_data['actions'][:]
                         dones = ep_data['dones'][:]
+                        rewards = (
+                            ep_data['rewards'][:].astype(np.float32)
+                            if 'rewards' in ep_data
+                            else np.zeros(num_samples, dtype=np.float32)
+                        )
+                        # Legacy files may omit rewards and encode success only
+                        # through the terminal flag.
+                        if 'rewards' not in ep_data and bool(dones[-1]):
+                            rewards[-1] = 1.0
                         # # The 'terminals' key exists inside each demo group
                         # terminals = ep_data['terminals'][:]
 
@@ -81,22 +99,40 @@ class HDF5CalQLDataset(Dataset):
                             next_states = np.zeros((num_samples, 0), dtype=np.float32)
 
                         # Compute Monte-Carlo returns for this episode
-                        final_success = bool(dones[-1])
                         mc_returns = np.zeros(num_samples, dtype=np.float32)
                         mc_return = 0.0
                         for i in reversed(range(num_samples)):
-                            reward = 1.0 if (i == num_samples - 1 and final_success) else 0.0
-                            mc_return = reward + self.gamma * mc_return
+                            mc_return = rewards[i] + self.gamma * mc_return * (1.0 - float(dones[i]))
                             mc_returns[i] = mc_return
 
-                        # Append transitions, ensuring correct shapes
+                        # Construct chunk-wise transitions. Near the end of an
+                        # episode we repeat the final action only as padding;
+                        # rewards and the bootstrap state still stop at the
+                        # true terminal transition.
                         for i in range(num_samples):
+                            end = min(i + self.action_horizon, num_samples)
+                            action_chunk = actions[i:end]
+                            if len(action_chunk) < self.action_horizon:
+                                padding = np.repeat(
+                                    action_chunk[-1:],
+                                    self.action_horizon - len(action_chunk),
+                                    axis=0,
+                                )
+                                action_chunk = np.concatenate([action_chunk, padding], axis=0)
+                            chunk_return = 0.0
+                            # A file boundary is a timeout/terminal for offline
+                            # training even if the environment did not report
+                            # success; never bootstrap beyond recorded data.
+                            chunk_done = end == num_samples
+                            for offset, step_idx in enumerate(range(i, end)):
+                                chunk_return += (self.gamma ** offset) * float(rewards[step_idx])
+                                chunk_done = chunk_done or bool(dones[step_idx])
                             self.transitions.append({
                                 "state": states[i].astype(np.float32),
-                                "action": actions[i].astype(np.float32),
-                                "reward": np.array([1.0 if (i == num_samples - 1 and final_success) else 0.0], dtype=np.float32),
-                                "next_state": next_states[i].astype(np.float32),
-                                "done": np.array(dones[i], dtype=np.float32),
+                                "action": action_chunk.reshape(-1).astype(np.float32),
+                                "reward": np.array([chunk_return], dtype=np.float32),
+                                "next_state": next_states[end - 1].astype(np.float32),
+                                "done": np.array([chunk_done], dtype=np.float32),
                                 "mc_return": np.array([mc_returns[i]], dtype=np.float32)
                             })
                 

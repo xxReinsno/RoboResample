@@ -89,6 +89,16 @@ class BaseHDF5Writer:
         ep_data_grp.create_dataset("dones", data=np.array(episode_data['dones']), compression='gzip')
         ep_data_grp.create_dataset("terminals", data=np.array(episode_data['dones']), compression='gzip')
 
+        # RESample V2 metadata is optional so legacy rollout files remain valid.
+        # Each value is time-aligned with ``actions``. Candidate tensors are
+        # diagnostics only and are never loaded as actor supervision targets.
+        if episode_data.get("acquisition"):
+            acquisition_grp = ep_data_grp.create_group("acquisition")
+            for key, value in episode_data["acquisition"].items():
+                acquisition_grp.create_dataset(
+                    key, data=np.asarray(value), compression="gzip"
+                )
+
         self._demo_counts[os.path.join(self.output_dir, hdf5_filename)] += 1
         logging.info(f"Successfully wrote {demo_key} to {hdf5_filename} ({num_samples} steps).")
 

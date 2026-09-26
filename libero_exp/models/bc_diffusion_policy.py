@@ -301,42 +301,33 @@ class BCDPPolicy(BasePolicy):
         
         return z0
 
+    def diffusion_features(self, data):
+        """Build the condition for a future action chunk.
+
+        With ``frame_stack=H`` and ``seq_len=H``, SequenceDataset returns
+        observations ``[t-H+1, ..., t, ..., t+H-1]`` but actions
+        ``[t, ..., t+H-1]``.  Only the first H observations may condition the
+        policy; the remaining observations are future information and must not
+        leak into training.
+        """
+        x = self.spatial_encode(data)
+        if getattr(self.cfg.policy, "action_chunk_mode", "aligned") == "future":
+            history_size = int(self.cfg.data.frame_stack)
+            if history_size < 1 or x.shape[1] < history_size:
+                raise ValueError("future action chunks require a valid observation history")
+            x = x[:, :history_size]
+        encoded = self.temporal_encode(x)
+        return encoded.mean(dim=1, keepdim=True)
+
     def get_action(self, cfg, data):
-        self.eval()
-        with torch.no_grad():
-            data = self.preprocess_input(data, train_mode=False)
-            x = self.spatial_encode(data)
-            self.latent_queue.append(x)     # [B, T, 5, E]
-            if len(self.latent_queue) > self.max_seq_len:
-                self.latent_queue.pop(0)
-            x = torch.cat(self.latent_queue, dim=1)  # (B, T, H_all)
-            x = self.temporal_encode(x)     # (B, T, E)
-            features = x.mean(dim=1, keepdim=True) # (B, 1, E)
-            
-        # Sample random noise
-        B = features.shape[0]
-        noise = torch.randn(B, self.cfg.policy.policy_head.network_kwargs.future_action_window_size+1, 
-                            self.cfg.policy.policy_head.network_kwargs.in_channels, 
-                            device=features.device)  # [B, T, E]
-
-        model_kwargs = dict(z=features)
-        sample_fn = self.policy_head.net.forward
-
-        if self.policy_head.ddim_diffusion is None:
-            self.policy_head.create_ddim(ddim_step=10)
-        samples = self.policy_head.ddim_diffusion.ddim_sample_loop(
-            sample_fn, 
-            noise.shape, 
-            noise, 
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            progress=False,
-            device=features.device,
-            eta=0.0
+        chunks, _ = self.get_sampled_actions(
+            data,
+            num_samples=1,
+            return_action_chunks=True,
+            advance_history=True,
         )
-        actions = samples[:, -1]  # [B, T, action_dim]
-        actions = torch.clamp(actions, -1.0, 1.0)  # optional
-
+        execution_index = int(getattr(cfg.sampler, "execution_index", 0))
+        actions = chunks[:, 0, execution_index]
         return actions.detach().squeeze(0).cpu().float().numpy()
 
     def reset(self):
@@ -344,7 +335,14 @@ class BCDPPolicy(BasePolicy):
 
 
 
-    def get_sampled_actions(self, data, num_samples=1, compute_log_prob=False):
+    def get_sampled_actions(
+        self,
+        data,
+        num_samples=1,
+        compute_log_prob=False,
+        return_action_chunks=False,
+        advance_history=False,
+    ):
         """
         Generates a batch of action samples AND optionally their log probabilities.
 
@@ -383,8 +381,12 @@ class BCDPPolicy(BasePolicy):
                 # If history is already full, just take the most recent items
                 padded_history = current_history[-self.max_seq_len:]
 
-            # Note: We do not modify self.latent_queue here, as this padding is only for this
-            # single inference call. The actual queue is managed by the main rollout loop.
+            if advance_history:
+                self.latent_queue.append(x)
+                if len(self.latent_queue) > self.max_seq_len:
+                    self.latent_queue.pop(0)
+
+            # Candidate sampling advances this queue exactly once per environment step.
             x_temporal = torch.cat(padded_history, dim=1) # Shape: [B, max_seq_len, E]
 
 
@@ -410,7 +412,7 @@ class BCDPPolicy(BasePolicy):
             noise = torch.randn(noise_shape, device=features.device)
             # Repeat the condition for each sample
             # `features` is (B, 1, E). After repeat, it's (B * num_samples, 1, E)
-            condition_z = features.repeat(num_samples, 1, 1)
+            condition_z = features.repeat_interleave(num_samples, dim=0)
 
 
             # expanded_features = features.unsqueeze(1).repeat(1, num_samples, 1, 1)
@@ -430,8 +432,9 @@ class BCDPPolicy(BasePolicy):
             
             # Reshape and get the final action
             reshaped_samples = samples.view(B, num_samples, samples.shape[1], samples.shape[2])
-            actions = reshaped_samples[:, :, -1, :]  # Shape: (B, num_samples, action_dim)
-            actions = torch.clamp(actions, -1.0, 1.0)
+            action_chunks = torch.clamp(reshaped_samples, -1.0, 1.0)
+            execution_index = int(getattr(self.cfg.sampler, "execution_index", 0))
+            actions = action_chunks[:, :, execution_index, :]
 
 
             log_probs = None
@@ -458,4 +461,29 @@ class BCDPPolicy(BasePolicy):
                 # Reshape back to (B, num_samples)
                 log_probs = log_probs.view(B, num_samples)
 
-        return actions, log_probs
+        return (action_chunks if return_action_chunks else actions), log_probs
+
+    def sample_candidates(self, observation, num_candidates):
+        """PolicyAdapter API: sample DiT chunks with shape [B, K, H, A]."""
+        chunks, _ = self.get_sampled_actions(
+            observation,
+            num_samples=num_candidates,
+            compute_log_prob=False,
+            return_action_chunks=True,
+            advance_history=True,
+        )
+        return chunks
+
+    def per_sample_loss(self, batch, augmentation=None):
+        """PolicyAdapter API: native DiT diffusion loss for each batch item."""
+        data = self.preprocess_input(batch, augmentation=augmentation)
+        features = self.diffusion_features(data)
+        repeats = self.cfg.policy.policy_head.network_kwargs.repeated_diffusion_steps
+        actions = data["actions"]
+        batch_size = actions.shape[0]
+        losses = self.policy_head.sample_loss(
+            actions.repeat(repeats, 1, 1),
+            features.repeat(repeats, 1, 1),
+            reduction="none",
+        )
+        return losses.reshape(repeats, batch_size).mean(dim=0), data

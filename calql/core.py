@@ -8,7 +8,10 @@ import torch.nn as nn
 from typing import Tuple, Dict
 import torch.nn.functional as F
 
-from model import Actor, Critic, MetaPolicy, MetaPolicyReplayBuffer
+try:
+    from .model import Actor, Critic, MetaPolicy, MetaPolicyReplayBuffer
+except ImportError:  # Preserve direct ``python calql/core.py`` usage.
+    from model import Actor, Critic, MetaPolicy, MetaPolicyReplayBuffer
 
 class CalQLLearner:
     """
@@ -58,7 +61,6 @@ class CalQLLearner:
             target_q = reward + (1. - done) * self.config.gamma * target_q_intermediate
 
         # --- Compute TD Loss ---
-        current_q1, current_q2 = self.critic(state, action)
         current_q1, current_q2 = self.critic(state, action)
 
         critic_loss_td = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
@@ -299,4 +301,3 @@ class CalQLLearnerWithHRL:
             self.critic_target_ensemble[i].load_state_dict(self.critics[i].state_dict())
         self.actor.load_state_dict(torch.load(os.path.join(path, "actor.pth"), map_location=self.device))
         self.meta_policy.load_state_dict(torch.load(os.path.join(path, "meta_policy.pth"), map_location=self.device))
-

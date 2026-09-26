@@ -2,7 +2,7 @@
 benchmark_envs: ["libero_spatial", "libero_object", "libero_goal", "libero_90", "libero_10", "libero_100"]
 env_name: "libero_spatial"
 root_dir: "/mnt/disk_2/guanxing/xueyq21thu/libero" 
-extra_rollout_paths: "/mnt/disk_2/guanxing/xueyq21thu/BC-IB/rollout_succ/libero_spatial_succ"
+extra_rollout_paths: []
 
 task_order_index: 0                 # if 0, demo list is [demo_0, demo_1, ...]
 train_ratio: 0.9                    # use xx% as trainset

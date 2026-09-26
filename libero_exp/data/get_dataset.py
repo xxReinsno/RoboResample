@@ -120,11 +120,12 @@ def get_rollout_dataset(
 
 
     physical_obs_keys = []
+    physical_to_abstract = {}
     for modality_list in obs_modality.values():
         for abstract_key in modality_list:
-            physical_key = ROLLOUT_KEY_MAPPING.get(abstract_key)
-            if physical_key:
-                physical_obs_keys.append(physical_key)
+            physical_key = ROLLOUT_KEY_MAPPING.get(abstract_key, abstract_key)
+            physical_obs_keys.append(physical_key)
+            physical_to_abstract[physical_key] = abstract_key
 
     keys_to_exclude_from_rollout = ['ee_ori', 'ee_pos', 'ee_states']
     physical_obs_keys = [key for key in physical_obs_keys if key not in keys_to_exclude_from_rollout]
@@ -135,8 +136,10 @@ def get_rollout_dataset(
     dataset = SequenceDataset(
         hdf5_path=dataset_path,
         obs_keys=physical_obs_keys,
-        dataset_keys=["actions", "rewards", "dones", "terminals"],
-        load_next_obs=True,
+        # Actor batches must have the same structure as demonstration batches.
+        # Rewards and outcomes remain available to the standalone critic loader.
+        dataset_keys=["actions"],
+        load_next_obs=False,
         frame_stack=frame_stack,
         seq_length=seq_len,
         pad_frame_stack=True,
@@ -153,15 +156,40 @@ def get_rollout_dataset(
     )
     
     print("--------------------------------------------------")
-    return dataset
+    return ObservationKeyRemapDataset(dataset, physical_to_abstract)
+
+
+class ObservationKeyRemapDataset(Dataset):
+    """Expose rollout observations under the policy's abstract key names."""
+
+    def __init__(self, sequence_dataset, key_mapping):
+        self.sequence_dataset = sequence_dataset
+        self.key_mapping = dict(key_mapping)
+        self.n_demos = sequence_dataset.n_demos
+        self.total_num_sequences = sequence_dataset.total_num_sequences
+
+    def __len__(self):
+        return len(self.sequence_dataset)
+
+    def __getitem__(self, idx):
+        item = self.sequence_dataset[idx]
+        for group_name in ("obs", "next_obs"):
+            if group_name in item:
+                item[group_name] = {
+                    self.key_mapping.get(key, key): value
+                    for key, value in item[group_name].items()
+                }
+        return item
 
 
 class SequenceVLDataset(Dataset):
-    def __init__(self, sequence_dataset, task_emb):
+    def __init__(self, sequence_dataset, task_emb, is_rollout=False, task_id=-1):
         self.sequence_dataset = sequence_dataset
         self.task_emb = task_emb
         self.n_demos = self.sequence_dataset.n_demos
         self.total_num_sequences = self.sequence_dataset.total_num_sequences
+        self.is_rollout = bool(is_rollout)
+        self.task_id = int(task_id)
 
     def __len__(self):
         return len(self.sequence_dataset)
@@ -169,6 +197,8 @@ class SequenceVLDataset(Dataset):
     def __getitem__(self, idx):
         return_dict = self.sequence_dataset.__getitem__(idx)
         return_dict["task_emb"] = self.task_emb
+        return_dict["is_rollout"] = np.array(self.is_rollout, dtype=np.bool_)
+        return_dict["task_id"] = np.array(self.task_id, dtype=np.int64)
         return return_dict
 
 

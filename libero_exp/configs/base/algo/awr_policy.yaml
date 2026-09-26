@@ -1,0 +1,17 @@
+algo_type: AWR_Policy
+algo_name: awr_policy
+
+awr:
+  critic_checkpoint_path: ???
+  value_checkpoint_path: ???
+  state_dim: 9
+  action_dim: 7
+  action_horizon: 10
+  value_hidden_dim: 256
+  weighting: awr  # bc | rwr | awr
+  baseline: value  # value | batch_mean
+  kappa: 1.0
+  beta: 1.0
+  min_weight: 0.05
+  max_weight: 20.0
+  rollout_scale: 1.0
